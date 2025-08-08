@@ -3,18 +3,19 @@
 namespace App\Filament\Resources;
 
 use App\Filament\Resources\TransferResource\Pages;
-use App\Filament\Resources\TransferResource\RelationManagers;
+use App\Models\SafeType;
 use App\Models\Transfer;
 use App\Models\TransferType;
+use App\Services\SafeBalanceService;
 use Filament\Forms;
 use Filament\Forms\Form;
 use Filament\Forms\Get;
+use Filament\Forms\Set;
 use Filament\Resources\Resource;
 use Filament\Tables;
 use Filament\Tables\Table;
-use Illuminate\Database\Eloquent\Builder;
-use Illuminate\Database\Eloquent\SoftDeletingScope;
-use Filament\Forms\Set;
+use Filament\Notifications\Notification;
+
 class TransferResource extends Resource
 {
     protected static ?string $model = Transfer::class;
@@ -31,9 +32,17 @@ class TransferResource extends Resource
                     ->schema([
                         Forms\Components\Select::make('transfer_type_id')
                             ->label('Transfer Type')
-                            ->options(TransferType::where('is_active', true)->pluck('name', 'id'))
+                            ->options(SafeType::where('is_active', true)->pluck('name', 'id'))
                             ->required()
-                            ->searchable(),
+                            ->searchable()
+                            ->live()
+                            ->afterStateUpdated(function ($state, Set $set) {
+                                // Show current safe balance when transfer type is selected
+                                if ($state) {
+                                    $balance = SafeBalanceService::getSafeTypeSummary($state);
+                                    $set('safe_balance_info', $balance ? $balance['current_balance'] : 0);
+                                }
+                            }),
 
                         Forms\Components\TextInput::make('transfer_number')
                             ->label('Transfer Number')
@@ -41,6 +50,22 @@ class TransferResource extends Resource
                             ->dehydrated(false)
                             ->placeholder('Auto-generated'),
                     ]),
+
+                // Safe Balance Information (read-only)
+                Forms\Components\Section::make('Safe Balance Information')
+                    ->schema([
+                        Forms\Components\Placeholder::make('safe_balance_display')
+                            ->label('Current Safe Balance')
+                            ->content(function (Get $get, $record) {
+                                $safeTypeId = $get('transfer_type_id');
+                                if ($safeTypeId) {
+                                    $summary = SafeBalanceService::getSafeTypeSummary($safeTypeId);
+                                    return $summary ? '$' . number_format($summary['current_balance'], 2) : '$0.00';
+                                }
+                                return 'Select transfer type to see balance';
+                            }),
+                    ])
+                    ->collapsible(),
 
                 Forms\Components\Section::make('Customer Information')
                     ->schema([
@@ -67,16 +92,21 @@ class TransferResource extends Resource
                                     ->required()
                                     ->step(0.01)
                                     ->live(onBlur: true)
-//                                    ->afterStateUpdated(function (Get $get, Set $set, ?string $state) {
-//                                        self::calculateReceiverAmount($get, $set);
-//                                    }
-                                    ,
+                                    ->afterStateUpdated(function (Get $get, Set $set) {
+                                        self::calculateReceiverAmount($get, $set);
+                                        self::updateProjectedBalance($get, $set);
+                                    }),
 
                                 Forms\Components\TextInput::make('transfer_cost')
                                     ->label('Transfer Cost (Our Cost)')
                                     ->numeric()
                                     ->required()
-                                    ->step(0.01),
+                                    ->step(0.01)
+                                    ->live(onBlur: true)
+                                    ->afterStateUpdated(function (Get $get, Set $set) {
+                                        self::calculateReceiverAmount($get, $set);
+                                        self::updateProjectedBalance($get, $set);
+                                    }),
                             ]),
 
                         Forms\Components\Grid::make(2)
@@ -87,16 +117,53 @@ class TransferResource extends Resource
                                     ->required()
                                     ->step(0.01)
                                     ->live(onBlur: true)
-//                                    ->afterStateUpdated(function (Get $get, Set $set, ?string $state) {
-//                                        self::calculateReceiverAmount($get, $set);
-//                                    })
-                                ,
+                                    ->afterStateUpdated(function (Get $get, Set $set) {
+                                        self::calculateReceiverAmount($get, $set);
+                                        self::updateProjectedBalance($get, $set);
+                                    }),
 
                                 Forms\Components\TextInput::make('receiver_net_amount')
                                     ->label('Receiver Net Amount')
                                     ->numeric()
                                     ->required()
                                     ->step(0.01)
+                                    ->live(onBlur: true)
+                                    ->afterStateUpdated(function (Get $get, Set $set) {
+                                        self::updateProjectedBalance($get, $set);
+                                    }),
+                            ]),
+
+                        // Balance Impact Preview
+                        Forms\Components\Grid::make(3)
+                            ->schema([
+                                Forms\Components\Placeholder::make('profit_preview')
+                                    ->label('Profit (when delivered)')
+                                    ->content(function (Get $get) {
+                                        $sent = (float) $get('sent_amount');
+                                        $cost = (float) $get('transfer_cost');
+                                        $customerPrice = (float) $get('customer_price');
+                                        $profit = ($sent - $cost) - $customerPrice ;
+                                        return '$' . number_format($profit, 2);
+                                    }),
+
+                                Forms\Components\Placeholder::make('checked_amount')
+                                    ->label('Amount added when checked')
+                                    ->content(function (Get $get) {
+                                        $sent = (float) $get('sent_amount');
+                                        $cost = (float) $get('transfer_cost');
+                                        $amount = $sent - $cost;
+                                        return '$' . number_format($amount, 2);
+                                    }),
+
+                                Forms\Components\Placeholder::make('delivered_amount')
+                                    ->label('Amount added when delivered')
+                                    ->content(function (Get $get) {
+                                        $sent = (float) $get('sent_amount');
+                                        $cost = (float) $get('transfer_cost');
+                                        $receiver = (float) $get('receiver_net_amount');
+                                        $amount = $sent - $receiver;
+                                        return '$' . number_format($amount, 2);
+                                    }),
                             ]),
                     ]),
 
@@ -106,12 +173,26 @@ class TransferResource extends Resource
                             ->schema([
                                 Forms\Components\Select::make('status')
                                     ->options([
-                                        'checked' => 'Checked',
+                                        'checked' => 'Checked (Check-in only)',
                                         'delivered' => 'Delivered',
                                         'canceled' => 'Canceled',
                                     ])
                                     ->default('checked')
-                                    ->required(),
+                                    ->required()
+                                    ->live()
+                                    ->afterStateUpdated(function (Get $get, Set $set, $state, $record) {
+                                        // Show balance validation when status changes
+                                        if ($record && $state !== $record->status) {
+                                            $validation = SafeBalanceService::validateTransferAgainstSafeBalance($record, $state);
+                                            if (!$validation['is_valid']) {
+                                                Notification::make()
+                                                    ->title('Balance Warning')
+                                                    ->body($validation['message'])
+                                                    ->warning()
+                                                    ->send();
+                                            }
+                                        }
+                                    }),
 
                                 Forms\Components\FileUpload::make('transfer_photo')
                                     ->label('Transfer Photo')
@@ -138,7 +219,20 @@ class TransferResource extends Resource
         }
     }
 
+    protected static function updateProjectedBalance(Get $get, Set $set): void
+    {
+        $safeTypeId = $get('transfer_type_id');
+        if (!$safeTypeId) return;
 
+        $summary = SafeBalanceService::getSafeTypeSummary($safeTypeId);
+        $currentBalance = $summary ? $summary['current_balance'] : 0;
+
+        $sent = (float) $get('sent_amount');
+        $cost = (float) $get('transfer_cost');
+        $checkedAmount = $sent - $cost;
+
+        $set('safe_balance_info', $currentBalance);
+    }
 
     public static function table(Table $table): Table
     {
@@ -162,6 +256,7 @@ class TransferResource extends Resource
                 Tables\Columns\TextColumn::make('sent_amount')
                     ->money('USD')
                     ->sortable(),
+
                 Tables\Columns\TextColumn::make('transfer_cost')
                     ->money('USD')
                     ->sortable(),
@@ -188,6 +283,15 @@ class TransferResource extends Resource
                         return $record->profit;
                     })
                     ->color(fn ($state) => $state >= 0 ? 'success' : 'danger'),
+
+                Tables\Columns\TextColumn::make('safe_amount')
+                    ->label('Safe Impact')
+                    ->money('USD')
+                    ->getStateUsing(function ($record) {
+                        return $record->safe_amount;
+                    })
+                    ->color(fn ($state) => $state >= 0 ? 'success' : 'danger')
+                    ->tooltip('Amount added to/removed from safe'),
 
                 Tables\Columns\TextColumn::make('created_at')
                     ->dateTime()
@@ -217,9 +321,36 @@ class TransferResource extends Resource
                     }),
             ])
             ->actions([
+                Tables\Actions\Action::make('view_balance_impact')
+                    ->label('Balance Impact')
+                    ->icon('heroicon-o-currency-dollar')
+                    ->modalHeading('Transfer Balance Impact')
+                    ->modalContent(function ($record) {
+                        $safeTypeId = $record->transfer_type_id;
+                        $validation = SafeBalanceService::validateTransferAgainstSafeBalance($record, $record->status);
+
+                        return view('filament.transfers.balance-impact', [
+                            'transfer' => $record,
+                            'validation' => $validation,
+                            'safe_summary' => SafeBalanceService::getSafeTypeSummary($safeTypeId)
+                        ]);
+                    }),
+
                 Tables\Actions\ViewAction::make(),
                 Tables\Actions\EditAction::make(),
-                Tables\Actions\DeleteAction::make(),
+                Tables\Actions\DeleteAction::make()
+                    ->before(function ($record) {
+                        // Validate balance before deletion
+                        $validation = SafeBalanceService::validateTransferAgainstSafeBalance($record, 'canceled');
+                        if (!$validation['is_valid']) {
+                            Notification::make()
+                                ->title('Cannot Delete Transfer')
+                                ->body($validation['message'])
+                                ->danger()
+                                ->send();
+                            return false;
+                        }
+                    }),
             ])
             ->bulkActions([
                 Tables\Actions\BulkActionGroup::make([
@@ -229,12 +360,9 @@ class TransferResource extends Resource
             ->defaultSort('created_at', 'desc');
     }
 
-
     public static function getRelations(): array
     {
-        return [
-            //
-        ];
+        return [];
     }
 
     public static function getPages(): array

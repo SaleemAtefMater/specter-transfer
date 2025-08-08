@@ -18,6 +18,16 @@ return new class extends Migration
             $table->timestamps();
             $table->softDeletes();
         });
+
+        Schema::table('transfer_types', function (Blueprint $table) {
+            if (!Schema::hasColumn('transfer_types', 'safe_type_id')) {
+                $table->foreignId('safe_type_id')
+                    ->nullable()
+                    ->after('id')
+                    ->constrained('safe_types')
+                    ->onDelete('set null');
+            }
+        });
     }
 
     /**
@@ -26,5 +36,12 @@ return new class extends Migration
     public function down(): void
     {
         Schema::dropIfExists('transfer_types');
+
+        Schema::table('transfer_types', function (Blueprint $table) {
+            if (Schema::hasColumn('transfer_types', 'safe_type_id')) {
+                $table->dropForeign(['safe_type_id']);
+                $table->dropColumn('safe_type_id');
+            }
+        });
     }
 };
