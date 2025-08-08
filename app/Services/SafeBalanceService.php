@@ -349,4 +349,57 @@ class SafeBalanceService
             'transfer_stats' => $transferStats,
         ];
     }
+
+    /**
+     * Validate transfer against safe balance (for status changes)
+     */
+    public static function validateTransferAgainstSafeBalance(Transfer $transfer, string $newStatus): array
+    {
+        try {
+            $safeTypeId = $transfer->transfer_type_id;
+            $currentBalance = self::getSafeBalance($safeTypeId);
+
+            // Calculate what the balance change would be
+            $currentAmount = 0;
+            $newAmount = 0;
+
+            // Current status impact
+            if (in_array($transfer->status, ['pending_verification', 'checked'])) {
+                $currentAmount = $transfer->sent_amount - $transfer->transfer_cost;
+            }
+
+            // New status impact
+            if (in_array($newStatus, ['pending_verification', 'checked'])) {
+                $newAmount = $transfer->sent_amount - $transfer->transfer_cost;
+            }
+
+            $balanceChange = $newAmount - $currentAmount;
+            $projectedBalance = $currentBalance + $balanceChange;
+
+            return [
+                'is_valid' => $projectedBalance >= 0,
+                'current_balance' => $currentBalance,
+                'balance_change' => $balanceChange,
+                'projected_balance' => $projectedBalance,
+                'message' => $projectedBalance >= 0 ?
+                    "Balance sufficient for this operation" :
+                    "Insufficient balance. Current: $" . number_format($currentBalance, 2) . ", Required: " . number_format(abs($balanceChange), 2)
+            ];
+
+        } catch (\Exception $e) {
+            Log::error("Balance validation failed", [
+                'transfer_id' => $transfer->id,
+                'new_status' => $newStatus,
+                'error' => $e->getMessage()
+            ]);
+
+            return [
+                'is_valid' => false,
+                'current_balance' => 0,
+                'balance_change' => 0,
+                'projected_balance' => 0,
+                'message' => "Validation error: " . $e->getMessage()
+            ];
+        }
+    }
 }
